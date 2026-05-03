@@ -14,9 +14,6 @@ from typing import NamedTuple
 from variables import _ACTION_MAP, ACTIONS
 import dm_env
 
-#python main.py --var model=SHELM --var env=MiniGrid-MemoryS11-v0 0.00005,
-#python main.py --var model=SHELM --var env=psychlab_continuous_recognition 
-#/mnt/c/Users/Christian/Documents/GitHub/SHELM/helm
 
 
 def generate_in_bg(generator, num_cached=10):
