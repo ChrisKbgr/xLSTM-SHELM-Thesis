@@ -1,5 +1,5 @@
 import gym
-from gym_minigrid.wrappers import RGBImgPartialObsWrapper, ImgObsWrapper
+#from gym_minigrid.wrappers import RGBImgPartialObsWrapper, ImgObsWrapper
 import numpy as np
 from typing import Optional
 from stable_baselines3.common.buffers import BaseBuffer
@@ -9,10 +9,14 @@ from typing import Union, Generator
 from queue import Queue
 import torch as th
 from typing import NamedTuple
-from procgen import ProcgenEnv
-from envs.random_maze import Env
+#from procgen import ProcgenEnv
+#from envs.random_maze import Env
 from variables import _ACTION_MAP, ACTIONS
 import dm_env
+
+#python main.py --var model=SHELM --var env=MiniGrid-MemoryS11-v0 0.00005,
+#python main.py --var model=SHELM --var env=psychlab_continuous_recognition 
+#/mnt/c/Users/Christian/Documents/GitHub/SHELM/helm
 
 
 def generate_in_bg(generator, num_cached=10):
@@ -216,13 +220,13 @@ def make_maze_env():
     return _init
 
 
-def make_procgen_env(id, num_levels, num_envs):
-    env = ProcgenEnv(env_name=id, num_envs=num_envs, distribution_mode='memory', num_levels=num_levels,
-                     start_level=0)
-    env = VecExtractDictObs(env, 'rgb')
-    env = VecMonitor(env)
-    env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=1.)
-    return env
+# def make_procgen_env(id, num_levels, num_envs):
+#     env = ProcgenEnv(env_name=id, num_envs=num_envs, distribution_mode='memory', num_levels=num_levels,
+#                      start_level=0)
+#     env = VecExtractDictObs(env, 'rgb')
+#     env = VecMonitor(env)
+#     env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=1.)
+#     return env
 
 
 class RolloutBufferSamples(NamedTuple):
@@ -278,7 +282,7 @@ class RolloutBuffer(BaseBuffer):
         gae_lambda: float = 1,
         gamma: float = 0.99,
         n_envs: int = 1,
-        hidden_dim: int = 1024
+        hidden_dim: int = 4096
     ):
         super(RolloutBuffer, self).__init__(buffer_size, observation_space, action_space, device, n_envs=n_envs)
         self.gae_lambda = gae_lambda

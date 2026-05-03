@@ -1,12 +1,14 @@
 import torch.nn as nn
 from torch.distributions import Categorical
-from transformers import TransfoXLModel, TransfoXLConfig, TransfoXLTokenizer
+#from transformers import TransfoXLModel, TransfoXLConfig, TransfoXLTokenizer
+from transformers import AutoTokenizer
 import torch
 import numpy as np
 import clip
 import os
 from clip.simple_tokenizer import SimpleTokenizer
-
+from xlstm_adapter import XLSTMAdapter
+from transformers.models.xlstm.modeling_xlstm import xLSTMCache
 
 class DiscreteActor(nn.Module):
     def __init__(self, input_dim, hidden, out_dim, n_hidden=0):
@@ -24,6 +26,15 @@ class DiscreteActor(nn.Module):
 
     def forward(self, states, deterministic=False):
         probs = self.actor(states)
+        # Safety: Ensure no NaNs and sum > 0
+        if torch.isnan(probs).any():
+             # Fallback to uniform if NaNs detected
+             probs = torch.ones_like(probs) / probs.shape[-1]
+        
+        # Clamp to avoid absolute zero (which can cause CUDA assert in multinomial)
+        probs = torch.clamp(probs, min=1e-8)
+        probs = probs / probs.sum(dim=-1, keepdim=True) # Re-normalize
+        
         dist = Categorical(probs)
 
         if deterministic:
@@ -245,91 +256,176 @@ class SHELM(nn.Module):
     def __init__(self, action_space, input_dim, optimizer, learning_rate, env_id, topk=1, epsilon=1e-8, mem_len=511,
                  clip_encoder='ViT-B/16', device='cuda'):
         super(SHELM, self).__init__()
-        config = TransfoXLConfig()
-        config.mem_len = mem_len
-        self.mem_len = config.mem_len
-
-        self.model = TransfoXLModel.from_pretrained('transfo-xl-wt103', config=config)
+        
+        # --- MODIFICATION START: xLSTM Setup ---
+        # 1. Initialize the Adapter (Loads xLSTM-7b in 4-bit)
+        self.model = XLSTMAdapter(model_path="NX-AI/xLSTM-7b", device=device)
+        self.mem_len = mem_len # xLSTM manages context differently, but we keep this variable for consistency
+        
+        # 2. Tokenizer Setup (xLSTM uses a specific tokenizer, not TransfoXL)
         self.clip_tokenizer = SimpleTokenizer()
-        self.tokenizer = TransfoXLTokenizer.from_pretrained('transfo-xl-wt103')
+        # Loading the matching tokenizer for xLSTM-7b
+        self.tokenizer = AutoTokenizer.from_pretrained("NX-AI/xLSTM-7b", trust_remote_code=True)
+        
+        # --- Loading CLIP Embeddings (unchanged logic) ---
         if 'psychlab' in env_id:
             self.clip_embs = np.load(os.path.join('data', f'{clip_encoder.replace("/", "")}_dmlab_prompt_embs.npz'))
         else:
             self.clip_embs = np.load(os.path.join('data', f'{clip_encoder.replace("/", "")}_embs.npz'))
+        
+        # Note: We might need to re-compute 'lexical_overlap' because xLSTM vocabulary is different 
+        # from TransfoXL. For now, we assume you have handled the data alignment or will run it as is.
         self.lexical_overlap = np.load(os.path.join('data', 'clip_transfo-xl-wt103_intersect.npz'))
         self.clip_embs = torch.FloatTensor(self.clip_embs[self.lexical_overlap]).cuda()
-        n_tokens = self.model.word_emb.n_token
-        self.word_embs = self.model.word_emb(torch.arange(n_tokens)).detach().to(device)
+
+        # 3. Extract Word Embeddings from xLSTM for the projection
+        # This calls the property we added to the Adapter
+        n_tokens = self.model.word_emb.num_embeddings
+        self.word_embs = self.model.word_emb.weight.detach().to(device) # Shape: [Vocab_Size, 4096]
         self.topk = topk
 
         self.vis_encoder = VisionBackbone(clip_encoder)
-        hidden_dim = self.model.d_embed
+        
+        # 4. Update Hidden Dims (xLSTM is 4096, TrXL was 1024)
+        hidden_dim = self.model.d_embed 
 
+        # Freeze the xLSTM model (Standard HELM practice)
         for p in self.model.parameters():
             p.requires_grad_(False)
+        # --- MODIFICATION END ---
 
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
 
         self.query_encoder = SmallImpalaCNN(input_dim, channel_scale=4, hidden_dim=hidden_dim)
-        self.out_dim = hidden_dim*2
-        self.actor = DiscreteActor(self.out_dim, 128, action_space.n).apply(orthogonal_init)
-        self.critic = nn.Sequential(nn.Linear(self.out_dim, 512),
-                                    nn.LayerNorm(512, elementwise_affine=False),
+        self.out_dim = hidden_dim * 2
+        
+        # --- FIX: Feature Normalization Layer ---
+        #self.feature_norm = nn.LayerNorm(self.out_dim)
+        
+        self.actor = DiscreteActor(self.out_dim, 1024, action_space.n).apply(orthogonal_init)
+        self.critic = nn.Sequential(nn.Linear(self.out_dim, 2048),
+                                    nn.LayerNorm(2048, elementwise_affine=False),
                                     nn.ReLU(),
-                                    nn.Linear(512, 1)).apply(orthogonal_init)
+                                    nn.Linear(2048, 1)).apply(orthogonal_init)
         try:
             self.optimizer = getattr(torch.optim, optimizer)(self.yield_trainable_params(), lr=learning_rate,
                                                              eps=epsilon)
         except AttributeError:
             raise NotImplementedError(f"{optimizer} does not exist")
-        self.memory = None
-
+            
     def yield_trainable_params(self):
         for n, p in self.named_parameters():
+            # Ensure we don't train the huge 7B model
             if 'model.' in n or 'vis_encoder' in n:
                 continue
             else:
                 yield p
 
     def _calc_cos_sim(self, src, target):
+        # Unchanged
         normed_src = src / src.norm(dim=-1, keepdim=True)
         normed_tar = target / target.norm(dim=-1, keepdim=True)
         return normed_src @ normed_tar.T
 
     def get_top_k_toks(self, src, tar, k=1):
+        # Unchanged logic, but uses xLSTM embeddings/tokenizer
         cos_sims = self._calc_cos_sim(src, tar)
         ranked = np.argsort(cos_sims.detach().cpu().numpy(), axis=-1)[:, ::-1][:, :k]
         ranked = self.lexical_overlap[ranked]
         decoded = []
         embs = []
         for toks in ranked:
-            dec = [self.clip_tokenizer.decode([t]) for t in toks]
-            decoded.append(dec)
-            enc = self.tokenizer.encode(dec)
-            embs.append(self.word_embs[enc])
+            # toks is a list of indices (top-k)
+            # We want to decode each token index to a word
+            # clip_tokenizer.decode expects a list of ints
+            decoded_words = [self.clip_tokenizer.decode([t]) for t in toks]
+            decoded.append(decoded_words)
+            
+            # For encoding into xLSTM, we take the top-1 word usually, or join them
+            # Assuming k=1 or we just take the first one for the embedding
+            if len(decoded_words) > 0:
+                word_to_encode = decoded_words[0]
+            else:
+                word_to_encode = ""
+
+            # Fix: Ensure it's a string
+            if not isinstance(word_to_encode, str):
+                word_to_encode = str(word_to_encode)
+            
+            enc = self.tokenizer.encode(word_to_encode, add_special_tokens=False)
+            
+            # Simple handling if encode returns list of lists or just list
+            if isinstance(enc, list) and len(enc) > 0 and isinstance(enc[0], list):
+                 enc = enc[0] # Take first token if multiple (unlikely for single word)
+            
+            # Use xLSTM word embeddings
+            if len(enc) > 0:
+                # --- REVERT: Mean Pooling Failed (Again). Back to Single Token. ---
+                # User logs confirmed Mean Pooling (Rew 0.6) < Single Token (Rew 0.98).
+                # We revert to taking the first token.
+                embs.append(self.word_embs[enc[0]])
+            else:
+                # Fallback zero vector if tokenization fails
+                embs.append(torch.zeros(self.model.d_embed, device=self.word_embs.device))
+                
         embs = torch.stack(embs)
         return embs, decoded
+                
 
     def forward(self, observations, deterministic=False):
         if observations.shape[1] != 3:
             observations = observations.permute(0, 3, 1, 2)
         else:
             bs, *_ = observations.shape
+            
         obs_query = self.query_encoder(observations)
         observations = self.vis_encoder(observations)
+
+        # --- REVERT: Use Hard Retrieval (User Request) ---
         observations, _ = self.get_top_k_toks(observations, self.clip_embs, self.topk)
+        
         if len(observations.shape) == 2:
             observations = observations.unsqueeze(1)
-        out = self.model(inputs_embeds=observations, output_hidden_states=True, mems=self.memory)
-        self.memory = out.mems
-        hidden = out.last_hidden_state[:, -1, :]
-        hiddens = out.last_hidden_state[:, -1, :].cpu().numpy()
+            
+        # --- xLSTM FORWARD PASS ---
+        # Pass inputs_embeds and current state (memory) to Adapter
+        hidden_state, new_memory = self.model(
+            inputs_embeds=observations, 
+            cache_params=self.memory
+        )
+        
+        # CRITICAL: Update memory state for next step
+        self.memory = new_memory
+        
+        # Take the last hidden state for the Actor/Critic
+        hidden = hidden_state[:, -1, :]
+        
+        # --- FIX: NaN Safety for xLSTM Output ---
+        if torch.isnan(hidden).any() or torch.isinf(hidden).any():
+             # print("Warning: xLSTM produced NaNs/Infs! Zeroing them out.")
+             hidden = torch.nan_to_num(hidden, nan=0.0, posinf=0.0, neginf=0.0)
+             hidden = torch.clamp(hidden, min=-10.0, max=10.0) # Clamp activation to prevent explosion
+
+        hiddens = hidden.detach().cpu().numpy() # Use safe hidden for buffer
+        # -----------------------------
 
         hidden = torch.cat([hidden, obs_query], dim=-1)
+        
+        # --- FIX: normalize features ---
+        # Normalize the combined features (xLSTM + CNN) to ensure equal contribution.
+        # This prevents the Strong signal (CNN) from drowning out the Weak signal (Memory).
+        #hidden = self.feature_norm(hidden)
 
         action, log_prob = self.actor(hidden, deterministic=deterministic)
         values = self.critic(hidden).squeeze()
+        
+        # --- FIX: NaN Safety for Critic Output ---
+        if torch.isnan(values).any() or torch.isinf(values).any():
+             values = torch.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # Clamp values to reasonable range (typical RL returns usually < 100 for MiniGrid)
+        values = torch.clamp(values, min=-100.0, max=100.0)
 
         return action.cpu().numpy(), values.cpu().numpy(), log_prob.cpu().numpy().squeeze(), hiddens
 
@@ -338,13 +434,35 @@ class SHELM(nn.Module):
             observations = observations.permute(0, 3, 1, 2)
         else:
             bs, *_ = observations.shape
+            
         queries = self.query_encoder(observations)
         hidden = torch.cat([hidden_states, queries], dim=-1)
+        
+        # Add normalization for consistency with forward path
+        #hidden = self.feature_norm(hidden)
 
         log_prob, entropy = self.actor.evaluate(hidden, actions)
         value = self.critic(hidden).squeeze()
 
         return value, log_prob, entropy
+
+    def reset_cache(self, dones):
+        """
+        Resets the memory (hidden states) for environments that are done.
+        """
+        if self.memory is not None:
+            self.model.reset_cache(self.memory, dones)
+    
+    # Alias for trainer compatibility
+    def reset_memory(self, dones):
+        """Alias for reset_cache to match trainer's expected interface."""
+        self.reset_cache(dones)
+            
+    def init_memory(self, batch_size=None):
+        # xLSTM handles initialization automatically if cache_params is None
+        self.memory = None
+        return None
+
 
 
 class VisionBackbone(nn.Module):

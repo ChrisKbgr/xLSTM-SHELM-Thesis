@@ -1,0 +1,29 @@
+name: helm-xlstm
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.11
+  - cuda=12.4
+  - cuda-nvcc=12.4
+  - pytorch=2.4.0
+  - pytorch-cuda=12.4
+  - cmake
+  - ninja
+  - pip
+
+  - pip:
+      - transformers>=4.41
+      - accelerate
+      - triton-windows
+      - bitsandbytes
+      - xlstm
+      - numpy<2
+      - tqdm
+      - omegaconf
+      - dacite
+      - torchmetrics
+      - ipykernel

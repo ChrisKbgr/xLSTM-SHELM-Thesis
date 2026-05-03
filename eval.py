@@ -5,12 +5,26 @@ import torch
 import inspect
 import os
 import numpy as np
-from utils import make_dmlab_env, make_maze_env, make_minigrid_env, make_procgen_env, make_miniworld_env
+from utils import make_minigrid_env
 import random
 from model import SHELM
 np.random.seed(101)
 torch.cuda.manual_seed(101)
 random.seed(101)
+
+def _missing_env_maker(name: str):
+    def _fn(*_args, **_kwargs):
+        raise NotImplementedError(
+            f"`{name}` not available. If you expected it, check `utils.py` and your optional dependencies."
+        )
+    return _fn
+
+# Import optional env makers safely (see comment in `experiment.py`).
+import utils as _utils
+make_dmlab_env = getattr(_utils, "make_dmlab_env", _missing_env_maker("make_dmlab_env"))
+make_maze_env = getattr(_utils, "make_maze_env", _missing_env_maker("make_maze_env"))
+make_miniworld_env = getattr(_utils, "make_miniworld_env", _missing_env_maker("make_miniworld_env"))
+make_procgen_env = getattr(_utils, "make_procgen_env", _missing_env_maker("make_procgen_env"))
 
 def create_parser():
     parser = ArgumentParser()

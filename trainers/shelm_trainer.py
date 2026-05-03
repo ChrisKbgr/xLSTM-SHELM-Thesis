@@ -9,7 +9,10 @@ import zipfile
 import glob
 import json
 import torch.cuda
-from gym import spaces
+try:
+    from gymnasium import spaces
+except ImportError:
+    from gym import spaces
 from torch.nn import functional as F
 import time
 from utils import get_linear_burn_in_fn, get_exp_decay, RolloutBuffer
@@ -114,7 +117,8 @@ class SHELMPPO(OnPolicyAlgorithm):
         config: dict = None,
         clip_decay: int = None,
         adv_norm: bool = False,
-        save_ckpt: bool = True
+        save_ckpt: bool = True,
+        wandb_log_fn=None
     ):
 
         super(SHELMPPO, self).__init__(
@@ -133,7 +137,7 @@ class SHELMPPO(OnPolicyAlgorithm):
             policy_kwargs=policy_kwargs,
             verbose=verbose,
             device=device,
-            create_eval_env=create_eval_env,
+            #create_eval_env=create_eval_env,
             _init_setup_model=False,
             supported_action_spaces=(
                 spaces.Box,
@@ -168,6 +172,9 @@ class SHELMPPO(OnPolicyAlgorithm):
         self.highest_return = 0.0
         self.config = config
         self._last_mems = None
+
+        # Store the logging function
+        self.wandb_log_fn = wandb_log_fn
 
         if lr_decay == 'none':
             self.learning_rate = constant_fn(learning_rate)
@@ -446,8 +453,7 @@ class SHELMPPO(OnPolicyAlgorithm):
         callback.on_rollout_start()
         # Initialize memory on first rollout collection
         if self._last_mems is None:
-            self._last_mems = [torch.zeros((self.policy.mem_len, self.n_envs, self.policy.model.d_embed)).to(self.device)
-                               for _ in range(self.policy.model.n_layer)]
+            self._last_mems = self.policy.init_memory(self.n_envs)
 
         start = time.time()
 
@@ -465,6 +471,10 @@ class SHELMPPO(OnPolicyAlgorithm):
                 self._last_mems = self.policy.memory
 
             new_obs, rewards, dones, infos = env.step(action)
+            
+            # Update the observation so the agent sees the new frame 
+            self._last_obs = new_obs 
+            
             self.num_timesteps += env.num_envs
 
             # Give access to local variables
@@ -478,20 +488,26 @@ class SHELMPPO(OnPolicyAlgorithm):
             add_obs = observations.cpu().numpy()
             action = np.expand_dims(action, axis=-1)
             rollout_buffer.add(add_obs, hidden, action, rewards, self._last_episode_starts, value, log_prob)
-            self._last_obs = new_obs
             self._last_episode_starts = dones
+            
+            # --- FIX: Trust policy.reset_memory() ---
+            # The manual loop here was corrupting xLSTM cache because of shape mismatch
+            self.policy.reset_memory(dones)
+            self._last_mems = self.policy.memory          
 
-            for l in range(len(self._last_mems)):
-                self._last_mems[l][:, self._last_episode_starts] = 0.
-
+        #Compute value for the last observation (bootstrapping) ---
         with th.no_grad():
-            image_obs = self._last_obs
-            high = env.observation_space.high.reshape(-1)[0]
-            observations = torch.tensor(image_obs / high).float().to(self.device)
-            self.policy.memory = self._last_mems
-            action, value, log_prob, hidden = self.policy(observations)
+             image_obs = self._last_obs
+             high = env.observation_space.high.reshape(-1)[0]
+             observations = torch.tensor(image_obs / high).float().to(self.device)
+             
+             # Use the latest memory state
+             self.policy.memory = self._last_mems 
+             
+             # We only need the value
+             _, last_values, _, _ = self.policy(observations)
 
-        rollout_buffer.compute_returns_and_advantage(last_values=value, dones=self._last_episode_starts)
+        rollout_buffer.compute_returns_and_advantage(last_values=last_values, dones=self._last_episode_starts)
         callback.on_rollout_end()
 
         if self.save_ckpt:
@@ -545,13 +561,21 @@ class SHELMPPO(OnPolicyAlgorithm):
     ) -> "OnPolicyAlgorithm":
         iteration = 0
 
+        if not isinstance(self.tensorboard_log, str):
+            self.tensorboard_log = str(self.tensorboard_log) # Will force 'True' to be 'True' (string), which fixes the TypeError
+
         total_timesteps, callback = self._setup_learn(
-            total_timesteps, None, callback, 1, 100, eval_log_path, reset_num_timesteps,
-            tb_log_name
-        )
+            total_timesteps,
+            eval_env,
+            callback,
+            self.tensorboard_log)
 
         latest_run = get_latest_run_id(self.tensorboard_log, 'PPO')
         self.save_path = os.path.join(os.path.join(self.tensorboard_log, f'PPO_{latest_run}'))
+
+        # Create the output directory if it doesn't exist
+        os.makedirs(self.save_path, exist_ok=True) # <-- ADD THIS LINE
+
         callback.on_training_start(locals(), globals())
         self._dump_sources(self.save_path)
         self._dump_config(self.save_path)
@@ -580,8 +604,54 @@ class SHELMPPO(OnPolicyAlgorithm):
                 self.logger.record("time/fps", fps)
                 self.logger.record("time/time_elapsed", int(time.time() - self.start_time), exclude="tensorboard")
                 self.logger.record("time/total_timesteps", self.num_timesteps, exclude="tensorboard")
-                self.logger.dump(step=self.num_timesteps)
+                
 
+                                # --- DIRECT WANDB CALL ---
+                if self.wandb_log_fn is not None:
+                    try:
+                        # 1. Collect metrics from the logger's internal dictionary
+                        logged_metrics = self.logger.name_to_value
+                        
+                        # 2. Filter and collect metrics (including the rollout metrics visible in console)
+                        metrics_to_log = {
+                            key: logged_metrics[key]
+                            for key in logged_metrics
+                            if key.startswith(("train/", "time/"))
+                        }
+
+
+
+                        # --- CRUCIAL ADDITION: Check for Rollout Metrics separately ---
+                        # The episode metrics are often logged to the logger's 'output_formats' but not the name_to_value dict immediately.
+                        # We manually check the last recorded episode info from the VecMonitor/VecNormalize wrapper buffer.
+                        
+                        # Check if the episode info buffer is available and non-empty
+                        if len(self.ep_info_buffer) > 0:
+                            import numpy as np # Need numpy for mean calculation if not already imported in shelm_trainer.py
+                            
+                            # Use the method provided by BaseAlgorithm to calculate the mean reward/length
+                            ep_info_list = list(self.ep_info_buffer)
+                            mean_reward = np.mean([info["r"] for info in ep_info_list])
+                            mean_length = np.mean([info["l"] for info in ep_info_list])
+
+                            metrics_to_log.update({
+                                "rollout/ep_rew_mean": mean_reward,
+                                "rollout/ep_len_mean": mean_length,
+                            })
+                        # -------------------------------------------------------------
+
+                        # 3. Call the external W&B logging function
+                        current_n_updates = logged_metrics.get("train/n_updates", 0) 
+                        
+                        # User wants x-axis to be TOTAL TIMESTEPS (Standard Behavior).
+                        # We pass the raw global step count.
+                        self.wandb_log_fn(metrics_to_log, self.num_timesteps, current_n_updates)
+                        
+                    except Exception as e:
+                        print(f"FATAL WANDB LOGGING ERROR: {e}")
+
+                self.logger.dump(step=self.num_timesteps)
+                
             self.train()
             self.counter += 1
 
