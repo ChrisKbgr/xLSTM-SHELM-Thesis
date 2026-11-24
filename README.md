@@ -12,7 +12,7 @@ Reinforcement Learning (RL) agents face significant challenges in Partially Obse
 
 In this thesis, we replace the TrXL with the newly introduced **Extended Long Short-Term Memory (xLSTM)**. xLSTM promises linear scaling with sequence length while maintaining the performance of Transformers. This repository provides the implementation of the xLSTM integration, stability improvements, and benchmarking against the original TrXL baseline.
 
-**📄 Read the full thesis here:** [`26SS-K11919229-Kühberger_Christian-Thesis_BSc-xLSTM_SHELM.pdf`](./26SS-K11919229-Kühberger_Christian-Thesis_BSc-xLSTM_SHELM.pdf)
+**📄 Read the full thesis here:** [`Kuehberger_BSc_Thesis_xLSTM_SHELM.pdf`](./Kuehberger_BSc_Thesis_xLSTM_SHELM.pdf)
 
 ## Key Results
 
